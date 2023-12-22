@@ -89,6 +89,13 @@ struct pcpu_ctx {
 
 struct pcpu_ctx pcpu_ctx[MAX_CPUS];
 
+struct cpu_task_data {
+	bool will_be_kicked;
+	u64 dsq_vtime;
+};
+
+struct cpu_task_data cpu_task_data[MAX_CPUS];
+
 /*
  * Domain context
  */
@@ -605,6 +612,43 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 			}
 		}
 	}
+	
+	/*
+	 * The task might also be forked/execd so check for wake up only
+	 */
+	if (wake_flags & SCX_WAKE_TTWU) {
+		u64 highest_vtime = 0;
+		s32 found_cpu = -1;
+		u64 current_vtime = p->scx.dsq_vtime;
+		struct cpu_task_data *ctd;
+
+		/*
+		 * Look for the currently running task with the highest vtime
+		 * and with a vtime higher than the current task
+		 */
+		bpf_for(cpu, 0, nr_cpus) {
+			if (cpu_to_dom_id(cpu) != taskc->dom_id || !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+				continue;
+			}
+			ctd = MEMBER_VPTR(cpu_task_data, [cpu]);
+			if (!ctd || ctd->will_be_kicked) {
+				continue;
+			}
+			if (vtime_before(current_vtime, ctd->dsq_vtime) && vtime_before(highest_vtime, ctd->dsq_vtime)) {
+				highest_vtime = ctd->dsq_vtime;
+				found_cpu = cpu;
+			}
+		}
+		if (found_cpu >= 0) {
+			cpu = found_cpu;
+			ctd = MEMBER_VPTR(cpu_task_data, [found_cpu]);
+			if (ctd && !ctd->will_be_kicked) {
+				ctd->will_be_kicked = true;		
+				scx_bpf_kick_cpu(found_cpu, SCX_KICK_PREEMPT);
+				goto direct;		
+			}
+		}
+	}
 
 	/*
 	 * We're going to queue on the domestic domain's DSQ. @prev_cpu may be
@@ -807,6 +851,15 @@ void BPF_STRUCT_OPS(rusty_running, struct task_struct *p)
 
 	if (!(taskc = lookup_task_ctx(p)))
 		return;
+		
+	s32 cpu = scx_bpf_task_cpu(p);
+	struct cpu_task_data *ctd;
+
+	ctd = MEMBER_VPTR(cpu_task_data, [cpu]);
+	if (ctd) {
+		ctd->will_be_kicked = false;
+		ctd->dsq_vtime = p->scx.dsq_vtime;
+	}
 
 	taskc->running_at = bpf_ktime_get_ns();
 	dom_id = taskc->dom_id;
