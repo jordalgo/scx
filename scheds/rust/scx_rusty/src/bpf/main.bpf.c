@@ -67,6 +67,7 @@ const volatile u32 load_half_life = 1000000000	/* 1s */;
 const volatile bool kthreads_local;
 const volatile bool fifo_sched;
 const volatile bool switch_partial;
+const volatile bool enable_preemption;
 const volatile u32 greedy_threshold;
 const volatile u32 debug;
 
@@ -78,9 +79,10 @@ const volatile u64 slice_ns = SCX_SLICE_DFL;
  */
 struct pcpu_ctx {
 	u32 dom_rr_cur; /* used when scanning other doms */
+	u64 task_vtime; /* vtime of the task currently on the cpu*/
 
 	/* libbpf-rs does not respect the alignment, so pad out the struct explicitly */
-	u8 _padding[CACHELINE_SIZE - sizeof(u32)];
+	u8 _padding[CACHELINE_SIZE - (sizeof(u32) + sizeof(u64))];
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 struct pcpu_ctx pcpu_ctx[MAX_CPUS];
@@ -116,6 +118,16 @@ struct dom_active_pids {
 };
 
 struct dom_active_pids dom_active_pids[MAX_DOMS];
+
+/*
+ * The CPUs associated with a domain
+ */
+struct dom_cpus {
+	s32 cpus[MAX_CPUS];
+	u64 nr_cpus;
+};
+
+struct dom_cpus dom_cpus[MAX_DOMS];
 
 const u64 ravg_1 = 1 << RAVG_FRAC_BITS;
 
@@ -345,6 +357,7 @@ u64 tune_params_gen;
 private(A) struct bpf_cpumask __kptr *all_cpumask;
 private(A) struct bpf_cpumask __kptr *direct_greedy_cpumask;
 private(A) struct bpf_cpumask __kptr *kick_greedy_cpumask;
+private(A) struct bpf_cpumask __kptr *preempted_cpumask;
 
 static inline bool vtime_before(u64 a, u64 b)
 {
@@ -460,6 +473,49 @@ static bool task_set_domain(struct task_ctx *taskc, struct task_struct *p,
 	}
 
 	return taskc->dom_id == new_dom_id;
+}
+
+static void set_next_dom_vtime_max(struct dom_ctx *domc, u32 dom_id, s32 cpu)
+{
+	s32 next_vtime_max_cpu = 0;
+	struct dom_cpus *domcpus;
+	struct pcpu_ctx *pcpuc;
+	u64 next_vtime_max = 0;
+	s32 i, cpu_i;
+
+	domc->vtime_max = 0;
+
+	domcpus = MEMBER_VPTR(dom_cpus, [dom_id]);
+	if (!domcpus)
+	{
+		scx_bpf_error("Failed to lookup dom cpus[%u]", dom_id);
+		return;
+	}
+
+	/*
+	 * This is so we don't have to iterate over ALL cpus but rather just the
+	 * ones in the domain.
+	 * TODO: replace with cpumask kfunc iterator when available.
+	 */
+	bpf_for(i, 0, domcpus->nr_cpus) {
+		if (i >= MAX_CPUS)
+			continue;
+
+		cpu_i = domcpus->cpus[i];
+		if (cpu_i == cpu)
+			continue;
+
+		pcpuc = MEMBER_VPTR(pcpu_ctx, [cpu_i]);
+		if (pcpuc && vtime_before(next_vtime_max, pcpuc->task_vtime)) {
+			next_vtime_max = pcpuc->task_vtime;
+			next_vtime_max_cpu = cpu_i;
+		}
+	}
+
+	if (next_vtime_max > 0) {
+		domc->vtime_max = next_vtime_max;
+		domc->vtime_max_cpu = next_vtime_max_cpu;
+	}
 }
 
 s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -654,6 +710,43 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 				stat_add(RUSTY_STAT_DIRECT_GREEDY_FAR, 1);
 				goto direct;
 			}
+		}
+	}
+
+	/*
+	 * This checks if there are any CPUs in the task's domain that can be
+	 * preempted i.e. if the task's vtime is less the highest vtime (vtime_max)
+	 * in the domain (minus a small buffer: slice_ns). If there is, then set
+	 * the vtime_max for the domain to the next highest vtime running on the
+	 * domain's CPUs. This is to increase responsiveness for higher priority
+	 * tasks. The task might also be forked/execd so check for wake up only.
+	 */
+	if (enable_preemption && (wake_flags & SCX_WAKE_TTWU)) {
+		u32 dom_id = taskc->dom_id;
+		struct bpf_cpumask *pre_cpumask;
+		struct dom_ctx *domc;
+
+		if (!(domc = bpf_map_lookup_elem(&dom_data, &dom_id))) {
+			scx_bpf_error("Failed to lookup dom[%u]", dom_id);
+			goto enoent;
+		}
+
+		if (!(pre_cpumask = preempted_cpumask)) {
+			scx_bpf_error("No preempted_cpumask found");
+			goto enoent;
+		}
+
+		if (bpf_cpumask_test_cpu(domc->vtime_max_cpu, p->cpus_ptr)
+		&& !bpf_cpumask_test_cpu(domc->vtime_max_cpu, pre_cpumask)
+		&& domc->vtime_max != 0
+		&& vtime_before(p->scx.dsq_vtime, domc->vtime_max - slice_ns)) {
+			cpu = domc->vtime_max_cpu;
+			bpf_cpumask_set_cpu(domc->vtime_max_cpu, pre_cpumask);
+
+			set_next_dom_vtime_max(domc, dom_id, cpu);
+			scx_bpf_put_idle_cpumask(idle_smtmask);
+			scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice_ns, SCX_ENQ_PREEMPT | SCX_ENQ_HEAD);
+			return cpu;
 		}
 	}
 
@@ -896,6 +989,12 @@ void BPF_STRUCT_OPS(rusty_running, struct task_struct *p)
 		return;
 	}
 
+	s32 cpu = scx_bpf_task_cpu(p);
+	struct pcpu_ctx *pcpuc = MEMBER_VPTR(pcpu_ctx, [cpu]);
+
+	if (pcpuc)
+		pcpuc->task_vtime = p->scx.dsq_vtime;
+
 	/*
 	 * Global vtime always progresses forward as tasks start executing. The
 	 * test and update can be performed concurrently from multiple CPUs and
@@ -904,17 +1003,45 @@ void BPF_STRUCT_OPS(rusty_running, struct task_struct *p)
 	 */
 	if (vtime_before(domc->vtime_now, p->scx.dsq_vtime))
 		domc->vtime_now = p->scx.dsq_vtime;
+
+	if (vtime_before(domc->vtime_max, p->scx.dsq_vtime)) {
+		domc->vtime_max = p->scx.dsq_vtime;
+		domc->vtime_max_cpu = scx_bpf_task_cpu(p);
+	}
 }
 
 void BPF_STRUCT_OPS(rusty_stopping, struct task_struct *p, bool runnable)
 {
 	struct task_ctx *taskc;
+	struct pcpu_ctx *pcpuc;
+	struct dom_ctx *domc;
+	u32 dom_id;
+	s32 cpu;
 
 	if (fifo_sched)
 		return;
 
+	cpu = scx_bpf_task_cpu(p);
+	pcpuc = MEMBER_VPTR(pcpu_ctx, [cpu]);
+
+	if (preempted_cpumask)
+		bpf_cpumask_clear_cpu(cpu, preempted_cpumask);
+
+	if (pcpuc)
+		pcpuc->task_vtime = 0;
+
 	if (!(taskc = lookup_task_ctx(p)))
 		return;
+
+	dom_id = taskc->dom_id;
+	domc = bpf_map_lookup_elem(&dom_data, &dom_id);
+	if (!domc) {
+		scx_bpf_error("Failed to lookup dom[%u]", dom_id);
+		return;
+	}
+
+	if (domc->vtime_max_cpu == cpu)
+		set_next_dom_vtime_max(domc, dom_id, cpu);
 
 	/* scale the execution time by the inverse of the weight and charge */
 	p->scx.dsq_vtime +=
@@ -1156,7 +1283,9 @@ static s32 create_dom(u32 dom_id)
 s32 BPF_STRUCT_OPS_SLEEPABLE(rusty_init)
 {
 	struct bpf_cpumask *cpumask;
+	struct dom_cpus *domcpus;
 	s32 i, ret;
+	u32 dom_id;
 
 	cpumask = bpf_cpumask_create();
 	if (!cpumask)
@@ -1179,6 +1308,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rusty_init)
 	if (cpumask)
 		bpf_cpumask_release(cpumask);
 
+	if (enable_preemption) {
+		cpumask = bpf_cpumask_create();
+		if (!cpumask)
+			return -ENOMEM;
+		cpumask = bpf_kptr_xchg(&preempted_cpumask, cpumask);
+		if (cpumask)
+			bpf_cpumask_release(cpumask);
+	}
+
 	if (!switch_partial)
 		scx_bpf_switch_all();
 
@@ -1188,8 +1326,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rusty_init)
 			return ret;
 	}
 
-	bpf_for(i, 0, nr_cpus)
+	bpf_for(i, 0, nr_cpus) {
 		pcpu_ctx[i].dom_rr_cur = i;
+		dom_id = cpu_to_dom_id(i);
+		domcpus = MEMBER_VPTR(dom_cpus, [dom_id]);
+		if (domcpus && domcpus->nr_cpus < MAX_CPUS)
+			domcpus->cpus[domcpus->nr_cpus++] = i;
+	}
 
 	return 0;
 }

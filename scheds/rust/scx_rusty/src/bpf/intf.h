@@ -17,6 +17,7 @@
 typedef unsigned char u8;
 typedef unsigned int u32;
 typedef unsigned long long u64;
+typedef int s32;
 #endif
 
 #include <scx/ravg.bpf.h>
@@ -97,6 +98,13 @@ struct bucket_ctx {
 
 struct dom_ctx {
 	u64 vtime_now;
+
+	/* The highest vtime for a task currently on this domain's cpus */
+	u64 vtime_max;
+
+	/* The CPU running the task that set vtime_max */
+	s32 vtime_max_cpu;
+
 	struct bpf_cpumask __kptr *cpumask;
 	struct bpf_cpumask __kptr *direct_greedy_cpumask;
 
