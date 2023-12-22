@@ -89,6 +89,13 @@ struct pcpu_ctx {
 
 struct pcpu_ctx pcpu_ctx[MAX_CPUS];
 
+struct cpu_task_data {
+	bool has_running_task;
+	u64 dsq_vtime;
+};
+
+struct cpu_task_data cpu_task_data[MAX_CPUS];
+
 /*
  * Domain context
  */
@@ -605,6 +612,42 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 			}
 		}
 	}
+	
+	/*
+	 * The task might also be forked/execd so check for wake up only
+	 */
+	if (wake_flags & SCX_WAKE_TTWU) {
+		u64 highest_vtime = 0;
+		s32 found_cpu = -1;
+		u64 current_vtime = p->scx.dsq_vtime;
+		struct cpu_task_data *ctd;
+		/*
+			* Look for the currently running task with the highest vtime
+			* and with a vtime higher than the current task
+			*/
+		bpf_for(cpu, 0, nr_cpus) {
+			if (cpu_to_dom_id(cpu) != taskc->dom_id) {
+				continue;
+			}
+			ctd = MEMBER_VPTR(cpu_task_data, [cpu]);
+			if (!ctd) {
+				continue;
+			}
+			if (!ctd->has_running_task) {
+				found_cpu = cpu;
+				break;
+			} else if (vtime_before(current_vtime, ctd->dsq_vtime) && vtime_before(highest_vtime, ctd->dsq_vtime)) {
+				highest_vtime = ctd->dsq_vtime;
+				found_cpu = cpu;
+			}
+		}
+		if (found_cpu >= 0) {
+			bpf_trace_printk("Jordan found cpu to kick %u. vtime %llu. Current vtime %llu", found_cpu, highest_vtime, current_vtime);
+			cpu = found_cpu;
+			scx_bpf_kick_cpu(found_cpu, SCX_KICK_PREEMPT);
+			goto direct;
+		}
+	}
 
 	/*
 	 * We're going to queue on the domestic domain's DSQ. @prev_cpu may be
@@ -807,6 +850,17 @@ void BPF_STRUCT_OPS(rusty_running, struct task_struct *p)
 
 	if (!(taskc = lookup_task_ctx(p)))
 		return;
+		
+	s32 cpu = scx_bpf_task_cpu(p);
+	struct cpu_task_data *ctd;
+
+	ctd = MEMBER_VPTR(cpu_task_data, [cpu]);
+	if (ctd) {
+		ctd->has_running_task = true;
+		ctd->dsq_vtime = p->scx.dsq_vtime;
+	}
+		
+	
 
 	taskc->running_at = bpf_ktime_get_ns();
 	dom_id = taskc->dom_id;
@@ -860,10 +914,19 @@ void BPF_STRUCT_OPS(rusty_stopping, struct task_struct *p, bool runnable)
 {
 	struct task_ctx *taskc;
 
-	if (fifo_sched)
-		return;
-
 	if (!(taskc = lookup_task_ctx(p)))
+		return;
+		
+	s32 cpu = scx_bpf_task_cpu(p);
+	struct cpu_task_data *ctd;
+
+	ctd = MEMBER_VPTR(cpu_task_data, [cpu]);
+	if (ctd) {
+		ctd->has_running_task = false;
+	}
+		
+		
+	if (fifo_sched)
 		return;
 
 	/* scale the execution time by the inverse of the weight and charge */
