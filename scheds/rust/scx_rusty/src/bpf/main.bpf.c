@@ -475,49 +475,6 @@ static bool task_set_domain(struct task_ctx *taskc, struct task_struct *p,
 	return taskc->dom_id == new_dom_id;
 }
 
-static void set_next_dom_vtime_max(struct dom_ctx *domc, u32 dom_id, s32 cpu)
-{
-	s32 next_vtime_max_cpu = 0;
-	struct dom_cpus *domcpus;
-	struct pcpu_ctx *pcpuc;
-	u64 next_vtime_max = 0;
-	s32 i, cpu_i;
-
-	domc->vtime_max = 0;
-
-	domcpus = MEMBER_VPTR(dom_cpus, [dom_id]);
-	if (!domcpus)
-	{
-		scx_bpf_error("Failed to lookup dom cpus[%u]", dom_id);
-		return;
-	}
-
-	/*
-	 * This is so we don't have to iterate over ALL cpus but rather just the
-	 * ones in the domain.
-	 * TODO: replace with cpumask kfunc iterator when available.
-	 */
-	bpf_for(i, 0, domcpus->nr_cpus) {
-		if (i >= MAX_CPUS)
-			continue;
-
-		cpu_i = domcpus->cpus[i];
-		if (cpu_i == cpu)
-			continue;
-
-		pcpuc = MEMBER_VPTR(pcpu_ctx, [cpu_i]);
-		if (pcpuc && vtime_before(next_vtime_max, pcpuc->task_vtime)) {
-			next_vtime_max = pcpuc->task_vtime;
-			next_vtime_max_cpu = cpu_i;
-		}
-	}
-
-	if (next_vtime_max > 0) {
-		domc->vtime_max = next_vtime_max;
-		domc->vtime_max_cpu = next_vtime_max_cpu;
-	}
-}
-
 s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -725,6 +682,9 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 		u32 dom_id = taskc->dom_id;
 		struct bpf_cpumask *pre_cpumask;
 		struct dom_ctx *domc;
+		struct dom_cpus *domcpus;
+		struct pcpu_ctx *pcpuc;
+		s32 i, cpu_i;
 
 		if (!(domc = bpf_map_lookup_elem(&dom_data, &dom_id))) {
 			scx_bpf_error("Failed to lookup dom[%u]", dom_id);
@@ -736,14 +696,39 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 			goto enoent;
 		}
 
-		if (bpf_cpumask_test_cpu(domc->vtime_max_cpu, p->cpus_ptr)
-		&& !bpf_cpumask_test_cpu(domc->vtime_max_cpu, pre_cpumask)
-		&& domc->vtime_max != 0
-		&& vtime_before(p->scx.dsq_vtime, domc->vtime_max - slice_ns)) {
-			cpu = domc->vtime_max_cpu;
-			bpf_cpumask_set_cpu(domc->vtime_max_cpu, pre_cpumask);
 
-			set_next_dom_vtime_max(domc, dom_id, cpu);
+		domcpus = MEMBER_VPTR(dom_cpus, [dom_id]);
+		if (!domcpus)
+		{	
+			scx_bpf_error("Failed to lookup dom cpus[%u]", dom_id);
+			goto enoent;
+		}
+
+		s32 found_cpu = -1;
+		u64 max_vtime = p->scx.dsq_vtime;
+		bpf_for(i, 0, domcpus->nr_cpus) {
+			if (i >= MAX_CPUS)
+				continue;
+
+			cpu_i = domcpus->cpus[i];
+
+			pcpuc = MEMBER_VPTR(pcpu_ctx, [cpu_i]);
+
+			if (!pcpuc) {
+				scx_bpf_error("No pcpu_ctx");
+				goto enoent;
+			}
+
+			if (bpf_cpumask_test_cpu(cpu_i, p->cpus_ptr)
+			&& !bpf_cpumask_test_cpu(cpu_i, pre_cpumask)
+			&& vtime_before(max_vtime, pcpuc->task_vtime)) {
+				found_cpu = cpu_i;
+				max_vtime = pcpuc->task_vtime;
+			}
+		}
+		if (found_cpu > -1) {
+			cpu = found_cpu;
+			bpf_cpumask_set_cpu(cpu, pre_cpumask);
 			scx_bpf_put_idle_cpumask(idle_smtmask);
 			scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice_ns, SCX_ENQ_PREEMPT | SCX_ENQ_HEAD);
 			return cpu;
@@ -993,7 +978,7 @@ void BPF_STRUCT_OPS(rusty_running, struct task_struct *p)
 	struct pcpu_ctx *pcpuc = MEMBER_VPTR(pcpu_ctx, [cpu]);
 
 	if (pcpuc)
-		pcpuc->task_vtime = p->scx.dsq_vtime;
+		pcpuc->task_vtime = p->scx.dsq_vtime - slice_ns;
 
 	/*
 	 * Global vtime always progresses forward as tasks start executing. The
@@ -1004,18 +989,14 @@ void BPF_STRUCT_OPS(rusty_running, struct task_struct *p)
 	if (vtime_before(domc->vtime_now, p->scx.dsq_vtime))
 		domc->vtime_now = p->scx.dsq_vtime;
 
-	if (vtime_before(domc->vtime_max, p->scx.dsq_vtime)) {
-		domc->vtime_max = p->scx.dsq_vtime;
-		domc->vtime_max_cpu = scx_bpf_task_cpu(p);
-	}
+	if (preempted_cpumask)
+		bpf_cpumask_clear_cpu(cpu, preempted_cpumask);
 }
 
 void BPF_STRUCT_OPS(rusty_stopping, struct task_struct *p, bool runnable)
 {
 	struct task_ctx *taskc;
 	struct pcpu_ctx *pcpuc;
-	struct dom_ctx *domc;
-	u32 dom_id;
 	s32 cpu;
 
 	if (fifo_sched)
@@ -1024,24 +1005,11 @@ void BPF_STRUCT_OPS(rusty_stopping, struct task_struct *p, bool runnable)
 	cpu = scx_bpf_task_cpu(p);
 	pcpuc = MEMBER_VPTR(pcpu_ctx, [cpu]);
 
-	if (preempted_cpumask)
-		bpf_cpumask_clear_cpu(cpu, preempted_cpumask);
-
 	if (pcpuc)
 		pcpuc->task_vtime = 0;
 
 	if (!(taskc = lookup_task_ctx(p)))
 		return;
-
-	dom_id = taskc->dom_id;
-	domc = bpf_map_lookup_elem(&dom_data, &dom_id);
-	if (!domc) {
-		scx_bpf_error("Failed to lookup dom[%u]", dom_id);
-		return;
-	}
-
-	if (domc->vtime_max_cpu == cpu)
-		set_next_dom_vtime_max(domc, dom_id, cpu);
 
 	/* scale the execution time by the inverse of the weight and charge */
 	p->scx.dsq_vtime +=
