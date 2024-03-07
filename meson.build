@@ -28,6 +28,8 @@ get_sys_incls = find_program(join_paths(meson.current_source_dir(),
                                         'meson-scripts/get_sys_incls'))
 test_sched  = find_program(join_paths(meson.current_source_dir(),
                                       'meson-scripts/test_sched'))
+fetch_libbpf = find_program(join_paths(meson.current_source_dir(),
+                                      'meson-scripts/fetch_libbpf'))
 build_libbpf = find_program(join_paths(meson.current_source_dir(),
                                       'meson-scripts/build_libbpf'))
 if enable_rust
@@ -74,10 +76,9 @@ if should_build_libbpf
     error('To build the libbpf library "make" and "jq" are required')
   endif
 
-  message('Updating libbpf submodule')
-  run_command('git', 'submodule', 'update', '--init', '--recursive', check: true)
-  # make sure it's clean
-  run_command('git', 'submodule', 'foreach', '--recursive', 'git', 'clean', '-xfd', check: true)
+  message('Fetching libbpf repo')
+  libbpf_commit = '4f875865b772c4f534bc0a665bbd988193825bd4'
+  run_command(fetch_libbpf, libbpf_commit, check: true).stdout()
 
   # setup the build target
   executable('cc_cflags_probe', 'meson-scripts/cc_cflags_probe.c', install: false, pie: true)
